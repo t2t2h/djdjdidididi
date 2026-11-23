@@ -1,0 +1,84 @@
+name: Build AflatoonSuite (with Xray VPN core)
+
+on:
+  workflow_dispatch:
+    inputs:
+      xray_version:
+        description: "xray-core version (latest or e.g. v25.3.6)"
+        required: false
+        default: "latest"
+
+jobs:
+  xray:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Build libaflxray.a (iOS arm64)
+        working-directory: xray
+        env:
+          XRAY_VERSION: ${{ inputs.xray_version }}
+        run: |
+          set -euxo pipefail
+          rm -f go.mod go.sum
+          go mod init aflxray
+          go get "github.com/xtls/xray-core@${XRAY_VERSION:-latest}"
+          go mod tidy
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CLANG="$(xcrun --sdk iphoneos --find clang)"
+          export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
+          export CC="$CLANG -arch arm64 -isysroot $SDK -miphoneos-version-min=14.0"
+          export CGO_CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=14.0"
+          export CGO_LDFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=14.0"
+          go build -buildmode=c-archive -trimpath -ldflags="-s -w" -o libaflxray.a .
+          ls -la libaflxray.a
+          go list -m github.com/xtls/xray-core | tee xray-version.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-ios
+          path: |
+            xray/libaflxray.a
+            xray/libaflxray.h
+            xray/xray-version.txt
+
+  build:
+    needs: xray
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xray-ios
+          path: libs
+      - name: Verify core is in place
+        run: |
+          set -eux
+          ls -la libs
+          test -f libs/libaflxray.a
+      - name: Install Theos + tools
+        run: |
+          set -eux
+          brew install ldid dpkg || true
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          set -eux
+          make clean || true
+          make package FINALPACKAGE=1
+      - name: Check Xray is linked
+        run: |
+          DYLIB=".theos/obj/AflatoonSuite.dylib"
+          ls -la "$DYLIB"
+          du -h "$DYLIB"
+          nm "$DYLIB" | grep -c AflXray || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AflatoonSuite
+          path: |
+            .theos/obj/AflatoonSuite.dylib
+            packages/*.deb
